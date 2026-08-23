@@ -1,0 +1,6 @@
+{
+  "name": "Nexa Builder",
+  "version": "3.0-stonic-ready",
+  "capabilities": ["website_generation","live_preview","ai_editing","version_history","export","model_discovery","agent_ready","future_voice_integration","future_automation_integration"],
+  "future_modules": {"voice": "STONIC", "tools": [], "memory": [], "publishing": "server_side_github_or_hosting"}
+}
