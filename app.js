@@ -17,7 +17,7 @@ const STEPS = [
   ["preview", "Rendering the live preview"]
 ];
 
-const sleep = ms => new Promise(r => setTimeout(r, ms));
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 const esc = x =>
   String(x).replace(/[&<>"']/g, m => ({
@@ -64,30 +64,29 @@ function renderSteps() {
 }
 
 
-/* -------------------------------------------------------
-   GEMINI MODEL DISCOVERY
-------------------------------------------------------- */
+/* =========================
+   FIND AVAILABLE GEMINI MODEL
+========================= */
 
 async function models(key) {
-  const r = await fetch(
+  const response = await fetch(
     "https://generativelanguage.googleapis.com/v1beta/models?key=" +
     encodeURIComponent(key)
   );
 
-  const d = await r.json().catch(() => ({}));
+  const data = await response.json().catch(() => ({}));
 
-  if (!r.ok) {
-    throw Error(
-      d.error?.message ||
-      `Gemini connection failed (HTTP ${r.status})`
+  if (!response.ok) {
+    throw new Error(
+      data.error?.message ||
+      `Gemini connection failed (HTTP ${response.status})`
     );
   }
 
-  const available = (d.models || [])
-    .filter(m =>
-      (m.supportedGenerationMethods || [])
-        .includes("generateContent")
-    );
+  const available = (data.models || []).filter(model =>
+    (model.supportedGenerationMethods || [])
+      .includes("generateContent")
+  );
 
   const preferred = [
     "gemini-3.7-flash",
@@ -100,14 +99,18 @@ async function models(key) {
   const selected =
     preferred
       .map(id =>
-        available.find(x => x.name === "models/" + id)
+        available.find(
+          model => model.name === "models/" + id
+        )
       )
       .find(Boolean) ||
-    available.find(x => /flash/i.test(x.name));
+    available.find(model =>
+      /flash/i.test(model.name)
+    );
 
   if (!selected) {
-    throw Error(
-      "No available Flash model was found for this Gemini API key."
+    throw new Error(
+      "No compatible Gemini Flash model was found for this API key."
     );
   }
 
@@ -115,14 +118,15 @@ async function models(key) {
 }
 
 
-/* -------------------------------------------------------
-   ERROR HELPERS
-------------------------------------------------------- */
+/* =========================
+   RETRY HELPERS
+========================= */
 
-function isRetryable(status, message = "") {
+function shouldRetry(status, message = "") {
   const text = String(message).toLowerCase();
 
   return (
+    status === 408 ||
     status === 429 ||
     status === 500 ||
     status === 503 ||
@@ -134,222 +138,232 @@ function isRetryable(status, message = "") {
   );
 }
 
-function friendlyError(status, message) {
-  if (status === 429) {
-    return "Gemini rate limit reached. Retrying automatically.";
-  }
+function getDelay(attempt) {
+  const base = 1500;
+  const exponential = base * Math.pow(2, attempt);
+  const jitter = Math.floor(Math.random() * 700);
 
-  if (status === 503) {
-    return "Gemini is temporarily busy. Retrying automatically.";
-  }
-
-  if (status === 500 || status === 504) {
-    return "Gemini temporarily failed to respond. Retrying automatically.";
-  }
-
-  return message || `Gemini request failed (HTTP ${status}).`;
+  return Math.min(
+    exponential + jitter,
+    15000
+  );
 }
 
 
-/* -------------------------------------------------------
-   GEMINI GENERATION WITH RETRIES
-------------------------------------------------------- */
+/* =========================
+   GEMINI REQUEST
+========================= */
 
-async function generateWithRetry(prompt, model, maxRetries = 4) {
+async function requestGemini(model, prompt) {
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(S.key)}`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        contents: [
+          {
+            parts: [
+              {
+                text: prompt
+              }
+            ]
+          }
+        ],
+        generationConfig: {
+          maxOutputTokens: 60000
+        }
+      })
+    }
+  );
+
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    const error = new Error(
+      data.error?.message ||
+      `Gemini request failed (HTTP ${response.status})`
+    );
+
+    error.status = response.status;
+
+    throw error;
+  }
+
+  const text =
+    data.candidates?.[0]?.content?.parts
+      ?.map(part => part.text || "")
+      .join("") || "";
+
+  if (!text.trim()) {
+    throw new Error(
+      "Gemini returned an empty response."
+    );
+  }
+
+  return text;
+}
+
+
+/* =========================
+   RELIABLE GEMINI CALL
+========================= */
+
+async function generateAI(prompt) {
+
+  const primary = S.model;
+
+  const fallbackModels = [
+    primary,
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite"
+  ].filter(Boolean);
+
+  const uniqueModels = [
+    ...new Set(fallbackModels)
+  ];
 
   let lastError = null;
 
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+  for (const model of uniqueModels) {
 
-    try {
+    for (let attempt = 0; attempt < 4; attempt++) {
 
-      step(
-        "build",
-        "active",
-        attempt === 0
-          ? "connecting to Gemini"
-          : `Gemini busy — retry ${attempt}/${maxRetries}`
-      );
+      try {
 
-      const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(S.key)}`,
-        {
-          method: "POST",
+        step(
+          "build",
+          "active",
+          `Generating with ${model}`
+        );
 
-          headers: {
-            "Content-Type": "application/json"
-          },
-
-          body: JSON.stringify({
-            contents: [
-              {
-                parts: [
-                  {
-                    text: prompt
-                  }
-                ]
-              }
-            ],
-
-            generationConfig: {
-              maxOutputTokens: 60000,
-              thinkingConfig: {
-                thinkingLevel: "medium"
-              }
-            }
-          })
-        }
-      );
-
-      const data = await response.json().catch(() => ({}));
-
-      if (!response.ok) {
-
-        const message =
-          data.error?.message ||
-          `Gemini error HTTP ${response.status}`;
-
-        if (
-          isRetryable(response.status, message) &&
-          attempt < maxRetries
-        ) {
-
-          lastError = new Error(
-            friendlyError(response.status, message)
+        const result =
+          await requestGemini(
+            model,
+            prompt
           );
 
+        S.model = model;
+
+        localStorage.setItem(
+          "nexa_model",
+          model
+        );
+
+        return result;
+
+      } catch (error) {
+
+        lastError = error;
+
+        if (
+          shouldRetry(
+            error.status,
+            error.message
+          ) &&
+          attempt < 3
+        ) {
+
           const delay =
-            Math.min(
-              15000,
-              2500 * Math.pow(2, attempt)
-            ) +
-            Math.floor(Math.random() * 800);
+            getDelay(attempt);
 
           step(
             "build",
             "active",
-            `${friendlyError(response.status, message)} Waiting...`
+            `${model} is busy. Retrying...`
           );
 
           await sleep(delay);
+
           continue;
         }
 
-        throw new Error(message);
+        break;
       }
-
-      const text =
-        data.candidates?.[0]?.content?.parts
-          ?.map(p => p.text || "")
-          .join("") || "";
-
-      if (!text.trim()) {
-        throw new Error(
-          "Gemini returned an empty response."
-        );
-      }
-
-      return text;
-
-    } catch (error) {
-
-      lastError = error;
-
-      if (
-        attempt < maxRetries &&
-        isRetryable(
-          error.status,
-          error.message
-        )
-      ) {
-
-        const delay =
-          Math.min(
-            15000,
-            2500 * Math.pow(2, attempt)
-          );
-
-        await sleep(delay);
-        continue;
-      }
-
-      throw error;
     }
   }
 
   throw lastError ||
-    new Error("Gemini generation failed.");
+    new Error(
+      "All available Gemini models failed."
+    );
 }
 
 
-/* -------------------------------------------------------
-   AI WEBSITE GENERATOR
-------------------------------------------------------- */
+/* =========================
+   WEBSITE GENERATION
+========================= */
 
-async function callAI(prompt) {
+async function callAI(userPrompt) {
 
-  const instruction = `
-You are Nexa Builder, a senior product designer,
+  const prompt = `
+You are Nexa AI Website Builder.
+
+You are a senior product designer,
 frontend engineer and creative director.
 
-Your job is to build a COMPLETE professional website
-from the user's brief.
+Create a COMPLETE, PROFESSIONAL,
+PRODUCTION-QUALITY website from the user's brief.
 
-IMPORTANT:
+Do NOT simply repeat the user's words.
 
-DO NOT simply repeat the user's prompt.
-
-INFER AND CREATE:
+You must intelligently create:
 
 - brand identity
-- professional navigation
+- navigation
 - hero section
 - strong headline
 - supporting copy
 - CTA buttons
-- real content
-- relevant sections
-- product/service presentation
-- testimonials or reviews where appropriate
+- professional sections
+- realistic content
+- product/service cards
 - trust elements
+- testimonials when appropriate
+- contact section
 - footer
-- responsive mobile layout
-- desktop layout
-- accessibility
-- hover states
-- focus states
-- smooth interactions
-- forms where appropriate
-- realistic business content
+- responsive mobile design
+- responsive desktop design
 - polished spacing
-- professional typography
 - visual hierarchy
-- premium UI
-- strong conversion structure
+- hover effects
+- focus states
+- useful interactions
+- forms where appropriate
+- smooth animations
+- premium visual design
 
-The result must look like a real production website.
+The result must feel like a real website
+designed for a real business.
 
-DO NOT create:
+IMPORTANT:
 
-- a text dump
-- a blank page
-- a simple template
-- repeated prompt text
-- huge empty spaces
-- placeholder sections
-- "website generated successfully"
-- fake unfinished UI
-
-If the user requests a perfume brand,
-create an actual premium perfume website.
+If the user requests a perfume website,
+actually create a luxury perfume website.
 
 If the user requests a restaurant,
-create an actual restaurant website.
+actually create a restaurant website.
 
 If the user requests a SaaS,
-create an actual SaaS landing/product website.
+actually create a real SaaS website.
 
-The website must be CUSTOM to the user's brief.
+Do NOT create a text dump.
+
+Do NOT merely display the user's prompt.
+
+Do NOT create an empty template.
+
+Do NOT use "website generated successfully"
+as the main website content.
+
+Do NOT leave large empty spaces.
+
+The website must be visually complete.
 
 TECHNICAL REQUIREMENTS:
 
@@ -359,65 +373,66 @@ Start with:
 
 <!doctype html>
 
-Use:
+Use semantic HTML.
 
-- semantic HTML
-- inline CSS
-- inline JavaScript
+Use inline CSS.
 
-Do not use markdown fences.
+Use inline JavaScript.
+
+Do not use Markdown.
+
+Do not use code fences.
 
 Do not explain anything outside the HTML.
 
-Do not depend on external frameworks.
+Do not require external frameworks.
 
-Use CSS gradients, shadows, cards, responsive grids,
-animations and polished UI where appropriate.
+The website will be displayed inside an iframe.
 
-Make the website visually complete from top to bottom.
+Make it responsive.
 
-The generated website will be placed inside an iframe.
+Make it polished.
+
+Make it custom to the user's brief.
 
 USER BRIEF:
 
-${prompt}
+${userPrompt}
 `;
 
-  let text = await generateWithRetry(
-    instruction,
-    S.model,
-    4
-  );
+  let html =
+    await generateAI(prompt);
 
-  text = text
+  html = html
     .replace(/^```html\s*/i, "")
     .replace(/^```\s*/i, "")
     .replace(/```\s*$/i, "")
     .trim();
 
-  const htmlStart =
-    text.toLowerCase().indexOf("<!doctype html");
+  const start =
+    html.toLowerCase()
+      .indexOf("<!doctype html");
 
-  if (htmlStart >= 0) {
-    text = text.slice(htmlStart);
+  if (start >= 0) {
+    html = html.slice(start);
   }
 
   if (
-    !text.toLowerCase().includes("<html") ||
-    !text.toLowerCase().includes("</html>")
+    !html.toLowerCase().includes("<html") ||
+    !html.toLowerCase().includes("</html>")
   ) {
     throw new Error(
-      "Gemini returned incomplete website HTML."
+      "AI returned incomplete website HTML."
     );
   }
 
-  return text;
+  return html;
 }
 
 
-/* -------------------------------------------------------
+/* =========================
    SETUP
-------------------------------------------------------- */
+========================= */
 
 function setup() {
 
@@ -437,8 +452,8 @@ function setup() {
         <h1>Connect your AI</h1>
 
         <p class="muted">
-          Paste your Gemini API key once.
-          Nexa will automatically discover an available
+          Connect your Gemini API key.
+          Nexa will automatically find an available
           Flash model.
         </p>
 
@@ -466,8 +481,7 @@ function setup() {
           class="muted"
           style="font-size:12px;margin-top:14px"
         >
-          Your key is stored only in this browser.
-          Keep this builder private.
+          Your API key is stored only in this browser.
         </p>
 
       </div>
@@ -488,11 +502,13 @@ function setup() {
         document.querySelector("#connect");
 
       button.disabled = true;
-      button.textContent = "Connecting…";
+      button.textContent =
+        "Connecting…";
 
       try {
 
-        const model = await models(key);
+        const model =
+          await models(key);
 
         S.key = key;
         S.model = model;
@@ -509,10 +525,12 @@ function setup() {
 
         render();
 
-      } catch (e) {
+      } catch (error) {
 
         document.querySelector("#err").innerHTML =
-          `<div class="error">${esc(e.message)}</div>`;
+          `<div class="error">
+            ${esc(error.message)}
+          </div>`;
 
       } finally {
 
@@ -525,9 +543,9 @@ function setup() {
 }
 
 
-/* -------------------------------------------------------
+/* =========================
    BUILDER
-------------------------------------------------------- */
+========================= */
 
 function builder() {
 
@@ -543,6 +561,7 @@ function builder() {
         </div>
 
         <div>
+
           <button
             id="previewTop"
             class="btn primary"
@@ -557,6 +576,7 @@ function builder() {
           >
             Reset Key
           </button>
+
         </div>
 
       </header>
@@ -575,17 +595,15 @@ function builder() {
           </div>
 
           <p class="muted">
-            Nexa thinks, plans, designs, builds,
-            checks and then opens your finished website.
+            Nexa thinks, plans, designs,
+            builds and prepares your preview.
           </p>
-
 
           <textarea
             id="prompt"
             class="prompt"
             placeholder="Create a premium perfume website for Noir Essence..."
           ></textarea>
-
 
           <div class="build">
 
@@ -597,7 +615,6 @@ function builder() {
             </button>
 
           </div>
-
 
           <div class="status">
 
@@ -649,7 +666,6 @@ function builder() {
 
           </div>
 
-
           <div class="preview">
 
             <div
@@ -659,27 +675,26 @@ function builder() {
 
               ${
                 S.site
-                  ? `
-                    <iframe
-                      id="frame"
-                      class="frame"
-                      sandbox="allow-scripts allow-forms allow-modals"
-                    ></iframe>
-                  `
-                  : `
-                    <div class="empty">
-                      <div>
-                        <h2>
-                          Finished website appears here
-                        </h2>
-
-                        <p>
-                          Preview unlocks after a
-                          successful build.
-                        </p>
-                      </div>
+                ? `
+                  <iframe
+                    id="frame"
+                    class="frame"
+                    sandbox="allow-scripts allow-forms allow-modals"
+                  ></iframe>
+                `
+                : `
+                  <div class="empty">
+                    <div>
+                      <h2>
+                        Finished website appears here
+                      </h2>
+                      <p>
+                        Preview unlocks after
+                        a successful build.
+                      </p>
                     </div>
-                  `
+                  </div>
+                `
               }
 
             </div>
@@ -693,11 +708,10 @@ function builder() {
     </div>
   `;
 
-
   renderSteps();
 
-
   if (S.site) {
+
     const frame =
       document.querySelector("#frame");
 
@@ -706,42 +720,47 @@ function builder() {
     }
   }
 
+  document.querySelector("#build")
+    .onclick = build;
 
-  document.querySelector("#build").onclick =
-    build;
+  document.querySelector("#previewTop")
+    .onclick = () => {
 
-
-  document.querySelector("#previewTop").onclick =
-    () => {
       if (!S.site) return;
 
-      location.hash = "#preview";
+      location.hash =
+        "#preview";
+
       render();
     };
 
+  document.querySelector("#open")
+    .onclick = () => {
 
-  document.querySelector("#open").onclick =
-    () => {
       if (!S.site) return;
 
-      location.hash = "#preview";
+      location.hash =
+        "#preview";
+
       render();
     };
 
+  document.querySelector("#export")
+    .onclick = exportSite;
 
-  document.querySelector("#export").onclick =
-    exportSite;
+  document.querySelector("#public")
+    .onclick = publish;
 
+  document.querySelector("#reset")
+    .onclick = () => {
 
-  document.querySelector("#public").onclick =
-    publish;
+      localStorage.removeItem(
+        "nexa_key"
+      );
 
-
-  document.querySelector("#reset").onclick =
-    () => {
-
-      localStorage.removeItem("nexa_key");
-      localStorage.removeItem("nexa_model");
+      localStorage.removeItem(
+        "nexa_model"
+      );
 
       S.key = "";
       S.model = "";
@@ -751,21 +770,26 @@ function builder() {
 }
 
 
-/* -------------------------------------------------------
-   BUILD
-------------------------------------------------------- */
+/* =========================
+   BUILD PROCESS
+========================= */
 
 async function build() {
 
   if (S.busy) return;
 
+  const input =
+    document.querySelector("#prompt");
+
   const prompt =
-    document.querySelector("#prompt")
-      ?.value
-      ?.trim();
+    input?.value?.trim();
 
   if (!prompt) {
-    toast("Describe the website first.");
+
+    toast(
+      "First describe the website."
+    );
+
     return;
   }
 
@@ -787,22 +811,22 @@ async function build() {
     step(
       "brief",
       "done",
-      "brief understood"
+      "requirements understood"
     );
 
 
     step(
       "plan",
       "active",
-      "creating information architecture"
+      "planning website structure"
     );
 
-    await sleep(500);
+    await sleep(600);
 
     step(
       "plan",
       "done",
-      "structure ready"
+      "structure planned"
     );
 
 
@@ -812,52 +836,52 @@ async function build() {
       "creating visual direction"
     );
 
-    await sleep(500);
+    await sleep(600);
 
     step(
       "design",
       "done",
-      "visual direction ready"
+      "visual system prepared"
     );
 
 
     step(
       "build",
       "active",
-      "generating the complete website"
+      "generating website with AI"
     );
 
 
-    const website =
+    const site =
       await callAI(prompt);
 
 
     step(
       "build",
       "done",
-      "complete website generated"
+      "website generated"
     );
 
 
     step(
       "content",
       "active",
-      "checking content and interactions"
+      "checking sections and interactions"
     );
 
-    await sleep(600);
+    await sleep(700);
 
     step(
       "content",
       "done",
-      "content and interactions ready"
+      "content checked"
     );
 
 
     step(
       "audit",
       "active",
-      "running final quality check"
+      "running quality check"
     );
 
     await sleep(700);
@@ -876,7 +900,8 @@ async function build() {
     );
 
 
-    S.site = website;
+    S.site =
+      site;
 
     localStorage.setItem(
       "nexa_site",
@@ -890,18 +915,22 @@ async function build() {
     step(
       "preview",
       "done",
-      "live preview ready"
+      "preview ready"
     );
 
 
-    S.history.unshift(prompt);
+    S.history.unshift(
+      prompt
+    );
 
     S.history =
       S.history.slice(0, 5);
 
     localStorage.setItem(
       "nexa_history",
-      JSON.stringify(S.history)
+      JSON.stringify(
+        S.history
+      )
     );
 
 
@@ -911,22 +940,22 @@ async function build() {
       "Website completed. Preview is ready."
     );
 
-  } catch (e) {
+  } catch (error) {
 
-    console.error(e);
-
-    const message =
-      e?.message ||
-      "Unknown build error.";
+    console.error(error);
 
     step(
       "build",
       "active",
-      "error — " + message
+      "error — " +
+      (error.message ||
+       "generation failed")
     );
 
     toast(
-      "Build failed: " + message
+      "Build failed: " +
+      (error.message ||
+       "Unknown error")
     );
 
   } finally {
@@ -936,9 +965,9 @@ async function build() {
 }
 
 
-/* -------------------------------------------------------
-   FULL PREVIEW
-------------------------------------------------------- */
+/* =========================
+   PREVIEW
+========================= */
 
 function preview() {
 
@@ -976,7 +1005,6 @@ function preview() {
 
       </div>
 
-
       <div class="preview-content">
 
         <iframe
@@ -989,57 +1017,57 @@ function preview() {
     </div>
   `;
 
+  document.querySelector("#pframe")
+    .srcdoc = S.site;
 
-  const frame =
-    document.querySelector("#pframe");
-
-  frame.srcdoc = S.site;
-
-
-  document.querySelector("#edit").onclick =
-    () => {
+  document.querySelector("#edit")
+    .onclick = () => {
 
       location.hash = "";
+
       render();
 
       setTimeout(() => {
-
         document
           .querySelector("#prompt")
           ?.focus();
-
       }, 100);
     };
 
-
-  document.querySelector("#back").onclick =
-    () => {
+  document.querySelector("#back")
+    .onclick = () => {
 
       location.hash = "";
+
       render();
     };
 
-
-  document.querySelector("#pub").onclick =
-    publish;
+  document.querySelector("#pub")
+    .onclick = publish;
 }
 
 
-/* -------------------------------------------------------
+/* =========================
    EXPORT
-------------------------------------------------------- */
+========================= */
 
 function exportSite() {
 
   if (!S.site) {
-    toast("Build a website first.");
+
+    toast(
+      "Build a website first."
+    );
+
     return;
   }
 
   const blob =
     new Blob(
       [S.site],
-      { type: "text/html" }
+      {
+        type: "text/html"
+      }
     );
 
   const url =
@@ -1049,6 +1077,7 @@ function exportSite() {
     document.createElement("a");
 
   a.href = url;
+
   a.download =
     "nexa-website.html";
 
@@ -1059,40 +1088,89 @@ function exportSite() {
   a.remove();
 
   setTimeout(
-    () => URL.revokeObjectURL(url),
+    () =>
+      URL.revokeObjectURL(url),
     1000
   );
 
   toast(
-    "Website HTML exported."
+    "Website exported."
   );
 }
 
 
-/* -------------------------------------------------------
+/* =========================
    PUBLIC
-------------------------------------------------------- */
+========================= */
 
 function publish() {
 
   if (!S.site) {
-    toast("Build a website first.");
+
+    toast(
+      "Build a website first."
+    );
+
     return;
   }
 
   exportSite();
 
   toast(
-    "Website exported. Upload the HTML to your hosting for a public URL."
+    "Website exported. Upload it to your hosting to make it public."
   );
 }
 
 
-/* -------------------------------------------------------
+/* =========================
    TOAST
-------------------------------------------------------- */
+========================= */
 
 function toast(message) {
 
   const t =
-  
+    document.createElement("div");
+
+  t.className =
+    "toast";
+
+  t.textContent =
+    message;
+
+  document.body.appendChild(t);
+
+  setTimeout(
+    () => t.remove(),
+    4000
+  );
+}
+
+
+/* =========================
+   START APP
+========================= */
+
+function render() {
+
+  if (
+    location.hash === "#preview" &&
+    S.site
+  ) {
+    preview();
+    return;
+  }
+
+  if (S.key) {
+    builder();
+    return;
+  }
+
+  setup();
+}
+
+addEventListener(
+  "hashchange",
+  render
+);
+
+render();
