@@ -1,93 +1,76 @@
-"use strict";
-
 /* =========================================================
-   NEXA AI WEBSITE BUILDER — COMPLETE APP.JS
+   NEXA BUILDER — COMPLETE APP.JS
    ========================================================= */
 
 const S = {
   key: localStorage.getItem("nexa_key") || "",
   model: localStorage.getItem("nexa_model") || "",
   site: localStorage.getItem("nexa_site") || "",
-  prompt: localStorage.getItem("nexa_prompt") || "",
-  history: readJSON("nexa_history", []),
+  history: JSON.parse(localStorage.getItem("nexa_history") || "[]"),
+  versions: JSON.parse(localStorage.getItem("nexa_versions") || "[]"),
   busy: false,
   steps: []
 };
 
 const STEPS = [
   ["brief", "Understanding your brief"],
-  ["plan", "Planning website structure"],
-  ["design", "Designing visual system"],
+  ["plan", "Planning the website structure"],
+  ["design", "Designing the visual system"],
   ["build", "Building the website"],
   ["content", "Adding content and interactions"],
   ["audit", "Running quality check"],
   ["preview", "Rendering the live preview"]
 ];
 
-function readJSON(key, fallback) {
-  try {
-    const value = localStorage.getItem(key);
-    return value ? JSON.parse(value) : fallback;
-  } catch {
-    return fallback;
-  }
-}
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-function esc(value) {
-  return String(value ?? "").replace(/[&<>"']/g, char => ({
+const esc = value =>
+  String(value ?? "").replace(/[&<>"']/g, char => ({
     "&": "&amp;",
     "<": "&lt;",
     ">": "&gt;",
     '"': "&quot;",
     "'": "&#39;"
   }[char]));
-}
-
-function toast(message, error = false) {
-  document.querySelector(".nexa-toast")?.remove();
-
-  const el = document.createElement("div");
-  el.className = "nexa-toast";
-  el.textContent = message;
-
-  el.style.cssText = `
-    position:fixed;
-    left:50%;
-    bottom:24px;
-    transform:translateX(-50%);
-    z-index:99999;
-    max-width:90%;
-    padding:12px 18px;
-    border-radius:12px;
-    color:#fff;
-    background:${error ? "#dc3545" : "#171923"};
-    box-shadow:0 12px 40px rgba(0,0,0,.35);
-    font:500 14px system-ui,sans-serif;
-  `;
-
-  document.body.appendChild(el);
-
-  setTimeout(() => el.remove(), 3500);
-}
 
 function saveState() {
-  localStorage.setItem("nexa_key", S.key);
-  localStorage.setItem("nexa_model", S.model);
-  localStorage.setItem("nexa_site", S.site);
-  localStorage.setItem("nexa_prompt", S.prompt);
-  localStorage.setItem("nexa_history", JSON.stringify(S.history.slice(0, 20)));
+  localStorage.setItem("nexa_site", S.site || "");
+  localStorage.setItem("nexa_model", S.model || "");
+  localStorage.setItem(
+    "nexa_history",
+    JSON.stringify(S.history || [])
+  );
+  localStorage.setItem(
+    "nexa_versions",
+    JSON.stringify(S.versions || [])
+  );
+}
+
+function toast(message) {
+  let el = document.querySelector(".toast");
+
+  if (!el) {
+    el = document.createElement("div");
+    el.className = "toast";
+    document.body.appendChild(el);
+  }
+
+  el.textContent = message;
+  el.style.display = "block";
+
+  clearTimeout(el._timer);
+
+  el._timer = setTimeout(() => {
+    el.style.display = "none";
+  }, 3500);
 }
 
 function step(id, status, note = "") {
-  const existing = S.steps.find(x => x[0] === id);
+  const found = S.steps.find(item => item[0] === id);
 
-  if (existing) {
-    existing[1] = status;
-    existing[2] = note;
+  if (found) {
+    found[1] = status;
+    found[2] = note;
   } else {
     S.steps.push([id, status, note]);
   }
@@ -96,26 +79,33 @@ function step(id, status, note = "") {
 }
 
 function renderSteps() {
-  const box = document.querySelector("#steps");
-  if (!box) return;
+  const el = document.querySelector("#steps");
 
-  box.innerHTML = STEPS.map(([id, label]) => {
+  if (!el) return;
+
+  el.innerHTML = STEPS.map(([id, label]) => {
     const item = S.steps.find(x => x[0] === id);
     const status = item?.[1] || "";
-    const note = item?.[2] || "";
-
-    let icon = "○";
-
-    if (status === "active") icon = "•";
-    if (status === "done") icon = "✓";
-    if (status === "error") icon = "!";
 
     return `
-      <div class="step ${status}">
-        <span class="icon">${icon}</span>
+      <div class="step ${esc(status)}">
+        <span class="icon">
+          ${
+            status === "done"
+              ? "✓"
+              : status === "active"
+                ? "•"
+                : "○"
+          }
+        </span>
+
         <span>
           ${esc(label)}
-          ${note ? ` — ${esc(note)}` : ""}
+          ${
+            item?.[2]
+              ? ` — ${esc(item[2])}`
+              : ""
+          }
         </span>
       </div>
     `;
@@ -127,7 +117,7 @@ function renderSteps() {
    GEMINI MODEL DISCOVERY
    ========================================================= */
 
-async function findModel(key) {
+async function models(key) {
   const response = await fetch(
     "https://generativelanguage.googleapis.com/v1beta/models?key=" +
     encodeURIComponent(key)
@@ -138,28 +128,73 @@ async function findModel(key) {
   if (!response.ok) {
     throw new Error(
       data.error?.message ||
-      `Gemini connection failed: HTTP ${response.status}`
+      `Gemini connection failed (HTTP ${response.status})`
     );
   }
 
-  const models = (data.models || []).filter(model =>
-    Array.isArray(model.supportedGenerationMethods) &&
-    model.supportedGenerationMethods.includes("generateContent")
+  const available = (data.models || []).filter(model =>
+    (model.supportedGenerationMethods || [])
+      .includes("generateContent")
   );
 
-  if (!models.length) {
+  const preferred = [
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+    "gemini-1.5-flash"
+  ];
+
+  const selected =
+    preferred
+      .map(id =>
+        available.find(
+          model => model.name === "models/" + id
+        )
+      )
+      .find(Boolean) ||
+    available.find(model =>
+      /flash/i.test(model.name)
+    ) ||
+    available[0];
+
+  if (!selected) {
     throw new Error(
-      "No Gemini model with generateContent is available for this API key."
+      "No compatible Gemini model was found."
     );
   }
-
-  const flash = models.find(model =>
-    /flash/i.test(model.name)
-  );
-
-  const selected = flash || models[0];
 
   return selected.name.replace(/^models\//, "");
+}
+
+
+/* =========================================================
+   RETRY SYSTEM
+   ========================================================= */
+
+function retryable(status, message = "") {
+  const text = String(message).toLowerCase();
+
+  return (
+    status === 408 ||
+    status === 429 ||
+    status === 500 ||
+    status === 502 ||
+    status === 503 ||
+    status === 504 ||
+    text.includes("high demand") ||
+    text.includes("overloaded") ||
+    text.includes("temporarily unavailable") ||
+    text.includes("resource exhausted")
+  );
+}
+
+function delayFor(attempt) {
+  return Math.min(
+    1200 * Math.pow(2, attempt) +
+    Math.floor(Math.random() * 600),
+    10000
+  );
 }
 
 
@@ -168,53 +203,61 @@ async function findModel(key) {
    ========================================================= */
 
 async function requestGemini(model, prompt) {
-  const url =
-    `https://generativelanguage.googleapis.com/v1beta/models/` +
-    `${encodeURIComponent(model)}:generateContent?key=` +
-    `${encodeURIComponent(S.key)}`;
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(S.key)}`,
+    {
+      method: "POST",
 
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      contents: [
-        {
-          role: "user",
-          parts: [
-            {
-              text: prompt
-            }
-          ]
+      headers: {
+        "Content-Type": "application/json"
+      },
+
+      body: JSON.stringify({
+        contents: [
+          {
+            role: "user",
+
+            parts: [
+              {
+                text: prompt
+              }
+            ]
+          }
+        ],
+
+        generationConfig: {
+          temperature: 0.7,
+          topP: 0.9,
+          maxOutputTokens: 60000
         }
-      ],
-      generationConfig: {
-        temperature: 0.75,
-        maxOutputTokens: 60000
-      }
-    })
-  });
+      })
+    }
+  );
 
-  const data = await response.json().catch(() => ({}));
+  const data =
+    await response.json().catch(() => ({}));
 
   if (!response.ok) {
     const error = new Error(
       data.error?.message ||
-      `Gemini error: HTTP ${response.status}`
+      `Gemini error HTTP ${response.status}`
     );
 
     error.status = response.status;
+
     throw error;
   }
 
   const text =
     data.candidates?.[0]?.content?.parts
       ?.map(part => part.text || "")
-      .join("") || "";
+      .join("") ||
+    "";
 
   if (!text.trim()) {
-    throw new Error("Gemini returned an empty response.");
+    throw new Error(
+      "Gemini returned an empty response."
+    );
   }
 
   return text;
@@ -222,163 +265,363 @@ async function requestGemini(model, prompt) {
 
 
 /* =========================================================
-   AI GENERATION WITH RETRY
+   AI GENERATION WITH FALLBACK
    ========================================================= */
-
-function shouldRetry(error) {
-  const message = String(error?.message || "").toLowerCase();
-
-  return [
-    408,
-    429,
-    500,
-    502,
-    503,
-    504
-  ].includes(error?.status) ||
-    message.includes("overloaded") ||
-    message.includes("high demand") ||
-    message.includes("temporarily unavailable");
-}
 
 async function generateAI(prompt) {
   if (!S.key) {
-    throw new Error("Gemini API key is not connected.");
+    throw new Error(
+      "Gemini API key is not connected."
+    );
   }
 
-  let model = S.model;
+  const candidates = [
+    S.model,
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+    "gemini-1.5-flash"
+  ].filter(Boolean);
 
-  if (!model) {
-    model = await findModel(S.key);
-    S.model = model;
-    localStorage.setItem("nexa_model", model);
-  }
+  const uniqueModels =
+    [...new Set(candidates)];
 
   let lastError = null;
 
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      return await requestGemini(model, prompt);
-    } catch (error) {
-      lastError = error;
+  for (const model of uniqueModels) {
 
-      if (!shouldRetry(error) || attempt === 2) {
+    for (let attempt = 0; attempt < 4; attempt++) {
+
+      try {
+        const result =
+          await requestGemini(
+            model,
+            prompt
+          );
+
+        S.model = model;
+
+        localStorage.setItem(
+          "nexa_model",
+          model
+        );
+
+        return result;
+
+      } catch (error) {
+
+        lastError = error;
+
+        if (
+          retryable(
+            error.status,
+            error.message
+          ) &&
+          attempt < 3
+        ) {
+          await sleep(
+            delayFor(attempt)
+          );
+
+          continue;
+        }
+
         break;
       }
-
-      await sleep(
-        1200 * Math.pow(2, attempt) +
-        Math.floor(Math.random() * 500)
-      );
     }
   }
 
-  throw lastError || new Error("Gemini request failed.");
+  throw (
+    lastError ||
+    new Error(
+      "All Gemini models failed."
+    )
+  );
 }
 
 
 /* =========================================================
-   CLEAN AI HTML
+   HTML CLEANING
    ========================================================= */
 
-function cleanHTML(value) {
-  let html = String(value || "")
-    .replace(/^```html\s*/i, "")
-    .replace(/^```\s*/i, "")
-    .replace(/```\s*$/i, "")
-    .trim();
+function cleanHTML(html) {
+  let output =
+    String(html || "")
+      .replace(/^\uFEFF/, "")
+      .replace(/^```html\s*/i, "")
+      .replace(/^```HTML\s*/i, "")
+      .replace(/^```\s*/i, "")
+      .replace(/```\s*$/i, "")
+      .trim();
 
-  const start = html
-    .toLowerCase()
-    .indexOf("<!doctype html");
+  const doctypeIndex =
+    output
+      .toLowerCase()
+      .indexOf("<!doctype html");
 
-  if (start >= 0) {
-    html = html.slice(start);
+  const htmlIndex =
+    output
+      .toLowerCase()
+      .indexOf("<html");
+
+  if (doctypeIndex >= 0) {
+    output =
+      output.slice(doctypeIndex);
+  } else if (htmlIndex >= 0) {
+    output =
+      "<!doctype html>\n" +
+      output.slice(htmlIndex);
   }
 
   if (
-    !html.toLowerCase().includes("<html") ||
-    !html.toLowerCase().includes("</html>")
+    !output
+      .toLowerCase()
+      .includes("<html") ||
+    !output
+      .toLowerCase()
+      .includes("</html>")
   ) {
     throw new Error(
       "AI returned incomplete website HTML."
     );
   }
 
-  return html;
+  return output;
+}
+
+function validateHTML(html) {
+  const text =
+    String(html || "").toLowerCase();
+
+  return [
+    "<html",
+    "</html>",
+    "<head",
+    "</head>",
+    "<body",
+    "</body>"
+  ].every(token =>
+    text.includes(token)
+  );
 }
 
 
 /* =========================================================
-   CREATE WEBSITE
+   VERSION HISTORY
    ========================================================= */
 
-async function createWebsite(userPrompt) {
+function addVersion(
+  site,
+  label = "Website version"
+) {
+  if (!site) return;
+
+  S.versions.unshift({
+    id: Date.now().toString(),
+    label,
+    createdAt:
+      new Date().toISOString(),
+    html: site
+  });
+
+  S.versions =
+    S.versions.slice(0, 15);
+
+  localStorage.setItem(
+    "nexa_versions",
+    JSON.stringify(S.versions)
+  );
+}
+
+function restoreVersion(id) {
+  const version =
+    S.versions.find(
+      item => item.id === id
+    );
+
+  if (!version) {
+    toast("Version not found.");
+    return;
+  }
+
+  if (S.site) {
+    addVersion(
+      S.site,
+      "Before restore"
+    );
+  }
+
+  S.site = version.html;
+
+  saveState();
+  render();
+
+  toast(
+    "Previous version restored."
+  );
+}
+
+
+/* =========================================================
+   WEBSITE GENERATION
+   ========================================================= */
+
+async function callAI(userPrompt) {
+
   const instruction = `
 You are Nexa AI Website Builder.
 
-You are a senior product designer,
-UX designer, frontend engineer and creative director.
+Act as a senior product designer,
+frontend engineer, UX designer and
+creative director.
 
-Create a COMPLETE, CUSTOM and professional
-production-quality website from the user's brief.
+Create a complete professional website
+from the user's brief.
 
-Do not simply repeat the user's prompt.
+The website must look like a real
+professional business website.
 
-Infer and create:
+Infer and implement:
 
 - brand identity
 - navigation
 - page structure
-- hero section
 - professional copy
-- services or products
-- benefits
-- social proof
-- testimonials when appropriate
-- FAQ
-- contact section
-- forms when useful
-- strong CTAs
-- footer
-- responsive mobile layout
-- desktop layout
-- accessibility
-- hover states
-- focus states
+- sections
+- calls to action
+- realistic content
 - useful interactions
-- subtle animations
-- polished spacing
+- responsive desktop layout
+- responsive mobile layout
+- accessibility
 - visual hierarchy
+- tasteful animations
+- hover states
+- working buttons
+- working navigation
+- realistic forms
+- professional spacing
+- polished typography
 
-The result must feel like a real professional
-website made for the specific business.
+Do not create a text dump.
 
-Do NOT create a generic template.
-Do NOT create a text dump.
-Do NOT merely describe a website.
+Do not use Lorem ipsum.
 
-Return ONLY ONE COMPLETE HTML DOCUMENT.
+Do not mention AI generation.
 
-Start exactly with:
+Do not add fake claims.
 
+Use only:
+- HTML
+- CSS
+- vanilla JavaScript
+
+Do not depend on React,
+Vue, Angular or other frameworks.
+
+Return ONLY ONE complete HTML document.
+
+Start with:
 <!doctype html>
 
-Use inline CSS and inline JavaScript.
-
-No Markdown.
-No code fences.
-No explanation.
-No external framework dependency.
+Do not use Markdown.
+Do not use code fences.
+Do not explain anything outside HTML.
 
 USER BRIEF:
 
 ${userPrompt}
 `;
 
-  const result = await generateAI(instruction);
+  const first =
+    cleanHTML(
+      await generateAI(
+        instruction
+      )
+    );
 
-  return cleanHTML(result);
+  if (!validateHTML(first)) {
+    throw new Error(
+      "Generated website failed validation."
+    );
+  }
+
+  /*
+    Second quality pass.
+    It keeps the first design but checks
+    functionality and responsive behavior.
+  */
+
+  const improvePrompt = `
+You are Nexa AI Quality Engineer.
+
+Improve the existing website below.
+
+IMPORTANT:
+Keep the same business,
+brand direction and main design.
+
+Do not turn it into another website.
+
+Check and improve:
+
+- responsive design
+- mobile layout
+- navigation
+- buttons
+- forms
+- spacing
+- typography
+- accessibility
+- JavaScript
+- visual hierarchy
+- usability
+- obvious broken elements
+- professional polish
+
+Do not remove important sections.
+
+Do not add fake claims.
+
+Return ONLY the complete HTML.
+
+Start with:
+<!doctype html>
+
+No Markdown.
+No code fences.
+No explanation.
+
+CURRENT WEBSITE:
+
+${first}
+`;
+
+  let finalSite = first;
+
+  try {
+
+    const improved =
+      cleanHTML(
+        await generateAI(
+          improvePrompt
+        )
+      );
+
+    if (validateHTML(improved)) {
+      finalSite = improved;
+    }
+
+  } catch (error) {
+
+    console.warn(
+      "Quality pass skipped:",
+      error
+    );
+  }
+
+  return finalSite;
 }
 
 
@@ -386,9 +629,12 @@ ${userPrompt}
    EDIT EXISTING WEBSITE
    ========================================================= */
 
-async function editWebsite(editPrompt) {
+async function editAI(editPrompt) {
+
   if (!S.site) {
-    throw new Error("There is no existing website to edit.");
+    throw new Error(
+      "There is no website to edit yet."
+    );
   }
 
   const instruction = `
@@ -396,45 +642,38 @@ You are Nexa AI Website Editor.
 
 The user already has a complete website.
 
-Modify the EXISTING website according to
-the user's edit request.
-
-IMPORTANT:
-
-Do not create a completely unrelated website.
+Modify the existing website according
+to the user's new instruction.
 
 Keep the existing:
 
 - brand
 - useful sections
+- useful content
 - navigation
-- content
 - design language
-- working functionality
 
-unless the user specifically asks to change them.
+unless the user specifically asks
+to change them.
 
-Actually implement the requested changes.
+Actually implement the requested change.
 
-Check:
+Make sure:
 
-- desktop layout
-- mobile layout
-- responsive behavior
-- buttons
-- navigation
-- forms
-- animations
-- accessibility
-- spacing
-- typography
-- JavaScript
-- broken elements
+- existing functionality works
+- buttons work
+- navigation works
+- forms work
+- mobile layout works
+- desktop layout works
+- responsive behavior works
+- no broken HTML
+- no broken JavaScript
+- no placeholder text
 
-Return ONLY the complete updated HTML document.
+Return ONLY the COMPLETE updated HTML.
 
 Start with:
-
 <!doctype html>
 
 No Markdown.
@@ -450,27 +689,39 @@ CURRENT WEBSITE:
 ${S.site}
 `;
 
-  const result = await generateAI(instruction);
+  const result =
+    cleanHTML(
+      await generateAI(
+        instruction
+      )
+    );
 
-  return cleanHTML(result);
+  if (!validateHTML(result)) {
+    throw new Error(
+      "Edited website failed validation."
+    );
+  }
+
+  return result;
 }
 
 
 /* =========================================================
-   SETUP SCREEN
+   SETUP
    ========================================================= */
 
 function setup() {
-  const app = document.querySelector("#app");
 
-  if (!app) return;
+  document.querySelector("#app")
+    .innerHTML = `
 
-  app.innerHTML = `
     <div class="setup">
 
       <div class="card">
 
-        <div class="logo">✦</div>
+        <div class="logo">
+          ✦
+        </div>
 
         <div
           class="eyebrow"
@@ -479,15 +730,19 @@ function setup() {
           ONE-TIME SETUP
         </div>
 
-        <h1>Connect your AI</h1>
+        <h1>
+          Connect your AI
+        </h1>
 
         <p class="muted">
           Connect your Gemini API key.
           Nexa will automatically find
-          a compatible AI model.
+          a compatible model.
         </p>
 
-        <b>Gemini API Key</b>
+        <b>
+          Gemini API Key
+        </b>
 
         <input
           id="key"
@@ -495,12 +750,16 @@ function setup() {
           type="password"
           placeholder="AIza..."
           autocomplete="off"
+          spellcheck="false"
         >
 
         <button
           id="connect"
           class="btn purple"
-          style="width:100%;margin-top:12px"
+          style="
+            width:100%;
+            margin-top:12px
+          "
         >
           Connect & Open Builder ✦
         </button>
@@ -509,10 +768,12 @@ function setup() {
 
         <p
           class="muted"
-          style="font-size:12px;margin-top:14px"
+          style="
+            font-size:12px;
+            margin-top:14px
+          "
         >
-          Your API key is stored locally
-          in this browser.
+          Your key stays in this browser.
         </p>
 
       </div>
@@ -520,33 +781,39 @@ function setup() {
     </div>
   `;
 
-  document.querySelector("#connect").onclick =
+  const keyInput =
+    document.querySelector("#key");
+
+  const connectButton =
+    document.querySelector("#connect");
+
+  connectButton.onclick =
     async () => {
 
-      const input =
-        document.querySelector("#key");
-
       const key =
-        input?.value.trim();
+        keyInput.value.trim();
 
       if (!key) {
-        toast(
-          "Please enter your Gemini API key.",
-          true
-        );
+
+        document.querySelector("#err")
+          .innerHTML = `
+            <div class="error">
+              Please enter your Gemini API key.
+            </div>
+          `;
+
         return;
       }
 
-      const button =
-        document.querySelector("#connect");
+      connectButton.disabled = true;
 
-      button.disabled = true;
-      button.textContent = "Connecting…";
+      connectButton.textContent =
+        "Connecting…";
 
       try {
 
         const model =
-          await findModel(key);
+          await models(key);
 
         S.key = key;
         S.model = model;
@@ -565,8 +832,8 @@ function setup() {
 
       } catch (error) {
 
-        document.querySelector("#err").innerHTML =
-          `
+        document.querySelector("#err")
+          .innerHTML = `
             <div class="error">
               ${esc(error.message)}
             </div>
@@ -574,12 +841,23 @@ function setup() {
 
       } finally {
 
-        button.disabled = false;
+        connectButton.disabled = false;
 
-        button.textContent =
+        connectButton.textContent =
           "Connect & Open Builder ✦";
       }
     };
+
+  keyInput.addEventListener(
+    "keydown",
+    event => {
+
+      if (event.key === "Enter") {
+        connectButton.click();
+      }
+
+    }
+  );
 }
 
 
@@ -588,14 +866,10 @@ function setup() {
    ========================================================= */
 
 function builder() {
-  const app = document.querySelector("#app");
 
-  if (!app) return;
+  document.querySelector("#app")
+    .innerHTML = `
 
-  const hasWebsite =
-    Boolean(S.site);
-
-  app.innerHTML = `
     <div class="app">
 
       <header class="top">
@@ -619,9 +893,17 @@ function builder() {
           <button
             id="previewTop"
             class="btn primary"
-            ${hasWebsite ? "" : "disabled"}
+            ${S.site ? "" : "disabled"}
           >
             Preview
+          </button>
+
+          <button
+            id="historyTop"
+            class="btn"
+            ${S.versions.length ? "" : "disabled"}
+          >
+            History
           </button>
 
           <button
@@ -638,6 +920,7 @@ function builder() {
 
       <main class="main">
 
+
         <section class="left">
 
           <div class="eyebrow">
@@ -645,34 +928,24 @@ function builder() {
           </div>
 
           <div class="title">
-
-            ${
-              hasWebsite
-                ? "Improve your website with AI."
-                : "Build a real website from a prompt."
-            }
-
+            Build a real website from a prompt.
           </div>
 
           <p class="muted">
-
-            ${
-              hasWebsite
-                ? "Tell Nexa what you want to change and it will edit your existing website."
-                : "Nexa understands, plans, designs, builds, checks and previews your website."
-            }
-
+            Create a website or edit your
+            existing website with AI.
           </p>
 
           <textarea
             id="prompt"
             class="prompt"
             placeholder="${
-              hasWebsite
-                ? "Example: Add a premium booking section..."
-                : "Example: Create a premium dental clinic website..."
+              S.site
+                ? "Tell Nexa what you want to change..."
+                : "Create a premium perfume website for Noir Essence..."
             }"
-          >${esc(S.prompt)}</textarea>
+          ></textarea>
+
 
           <div class="build">
 
@@ -680,16 +953,15 @@ function builder() {
               id="build"
               class="btn primary"
             >
-
               ${
-                hasWebsite
+                S.site
                   ? "Edit Website ✦"
-                  : "Build Website ✦"
+                  : "Build ✦"
               }
-
             </button>
 
           </div>
+
 
           <div class="status">
 
@@ -707,28 +979,60 @@ function builder() {
 
           </div>
 
+
           ${
-            S.history.length
+            S.versions.length
               ? `
-                <div class="history">
+                <div
+                  class="status"
+                  style="margin-top:12px"
+                >
 
-                  <b>
-                    Recent prompts
-                  </b>
+                  <div class="status-head">
+                    <b>
+                      Recent versions
+                    </b>
+                  </div>
 
-                  ${S.history
-                    .slice(0, 5)
-                    .map(
-                      (item, index) => `
-                        <button
-                          class="history-item"
-                          data-index="${index}"
+                  <div>
+
+                    ${S.versions
+                      .slice(0, 5)
+                      .map(version => `
+                        <div
+                          class="step"
+                          style="cursor:pointer"
+                          data-version="${esc(version.id)}"
                         >
-                          ${esc(item)}
-                        </button>
-                      `
-                    )
-                    .join("")}
+
+                          <span class="icon">
+                            ↶
+                          </span>
+
+                          <span>
+
+                            ${esc(version.label)}
+
+                            <small
+                              style="
+                                display:block;
+                                opacity:.6
+                              "
+                            >
+                              ${esc(
+                                new Date(
+                                  version.createdAt
+                                ).toLocaleString()
+                              )}
+                            </small>
+
+                          </span>
+
+                        </div>
+                      `)
+                      .join("")}
+
+                  </div>
 
                 </div>
               `
@@ -751,7 +1055,7 @@ function builder() {
               <button
                 id="open"
                 class="btn"
-                ${hasWebsite ? "" : "disabled"}
+                ${S.site ? "" : "disabled"}
               >
                 Open
               </button>
@@ -759,7 +1063,7 @@ function builder() {
               <button
                 id="export"
                 class="btn"
-                ${hasWebsite ? "" : "disabled"}
+                ${S.site ? "" : "disabled"}
               >
                 Export
               </button>
@@ -767,295 +1071,4 @@ function builder() {
               <button
                 id="public"
                 class="btn purple"
-                ${hasWebsite ? "" : "disabled"}
-              >
-                Public
-              </button>
-
-            </div>
-
-          </div>
-
-
-          <div class="preview">
-
-            <div
-              class="framebox"
-              id="box"
-            >
-
-              ${
-                hasWebsite
-                  ? `
-                    <iframe
-                      id="frame"
-                      class="frame"
-                      sandbox="allow-scripts allow-forms allow-modals"
-                      title="Generated website preview"
-                    ></iframe>
-                  `
-                  : `
-                    <div class="empty">
-
-                      <div>
-
-                        <h2>
-                          Your finished website
-                          appears here
-                        </h2>
-
-                        <p>
-                          Build a website to begin.
-                        </p>
-
-                      </div>
-
-                    </div>
-                  `
-              }
-
-            </div>
-
-          </div>
-
-        </section>
-
-      </main>
-
-    </div>
-  `;
-
-  renderSteps();
-
-
-  /* Preview existing website */
-
-  if (hasWebsite) {
-
-    const frame =
-      document.querySelector("#frame");
-
-    if (frame) {
-      frame.srcdoc = S.site;
-    }
-
-  }
-
-
-  /* Prompt */
-
-  const prompt =
-    document.querySelector("#prompt");
-
-  if (prompt) {
-
-    prompt.oninput = () => {
-
-      S.prompt = prompt.value;
-
-      localStorage.setItem(
-        "nexa_prompt",
-        S.prompt
-      );
-
-    };
-
-  }
-
-
-  /* Build */
-
-  document.querySelector("#build")
-    .onclick = buildOrEdit;
-
-
-  /* Preview */
-
-  document.querySelector("#previewTop")
-    .onclick = () => {
-
-      if (!S.site) return;
-
-      location.hash = "#preview";
-
-      render();
-    };
-
-
-  document.querySelector("#open")
-    .onclick = () => {
-
-      if (!S.site) return;
-
-      location.hash = "#preview";
-
-      render();
-    };
-
-
-  /* Export */
-
-  document.querySelector("#export")
-    .onclick = exportSite;
-
-
-  /* Public */
-
-  document.querySelector("#public")
-    .onclick = publish;
-
-
-  /* Reset */
-
-  document.querySelector("#reset")
-    .onclick = () => {
-
-      localStorage.removeItem(
-        "nexa_key"
-      );
-
-      localStorage.removeItem(
-        "nexa_model"
-      );
-
-      S.key = "";
-      S.model = "";
-
-      render();
-    };
-
-
-  /* History */
-
-  document
-    .querySelectorAll(".history-item")
-    .forEach(button => {
-
-      button.onclick = () => {
-
-        const index =
-          Number(button.dataset.index);
-
-        const item =
-          S.history[index];
-
-        if (!item || !prompt) return;
-
-        prompt.value = item;
-
-        S.prompt = item;
-
-        localStorage.setItem(
-          "nexa_prompt",
-          item
-        );
-
-        prompt.focus();
-      };
-
-    });
-}
-
-
-/* =========================================================
-   BUILD OR EDIT
-   ========================================================= */
-
-async function buildOrEdit() {
-
-  if (S.busy) return;
-
-  const input =
-    document.querySelector("#prompt");
-
-  const prompt =
-    input?.value.trim();
-
-  if (!prompt) {
-
-    toast(
-      S.site
-        ? "Tell Nexa what you want to change."
-        : "Describe the website you want to build.",
-      true
-    );
-
-    return;
-  }
-
-  S.busy = true;
-  S.prompt = prompt;
-  S.steps = [];
-
-  saveState();
-  renderSteps();
-
-  try {
-
-    /* ================= CREATE ================= */
-
-    if (!S.site) {
-
-      step(
-        "brief",
-        "active",
-        "understanding requirements"
-      );
-
-      await sleep(300);
-
-      step(
-        "brief",
-        "done",
-        "requirements understood"
-      );
-
-
-      step(
-        "plan",
-        "active",
-        "planning website structure"
-      );
-
-      await sleep(400);
-
-      step(
-        "plan",
-        "done",
-        "structure planned"
-      );
-
-
-      step(
-        "design",
-        "active",
-        "creating visual system"
-      );
-
-      await sleep(400);
-
-      step(
-        "design",
-        "done",
-        "visual system ready"
-      );
-
-
-      step(
-        "build",
-        "active",
-        "generating complete website"
-      );
-
-      S.site =
-        await createWebsite(prompt);
-
-      step(
-        "build",
-        "done",
-        "website generated"
-      );
-
-
-      step(
-        "conten
+            
